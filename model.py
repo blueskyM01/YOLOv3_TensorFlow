@@ -11,7 +11,7 @@ from utils.layer_utils import conv2d, darknet53_body, yolo_block, upsample_layer
 
 class yolov3(object):
 
-    def __init__(self, class_num, anchors, use_label_smooth=False, use_focal_loss=False, batch_norm_decay=0.999, weight_decay=5e-4):
+    def __init__(self, class_num, anchors, use_label_smooth=False, use_focal_loss=False, batch_norm_decay=0.999, weight_decay=5e-4, use_static_shape=True):
 
         # self.anchors = [[10, 13], [16, 30], [33, 23],
                          # [30, 61], [62, 45], [59,  119],
@@ -22,6 +22,10 @@ class yolov3(object):
         self.use_label_smooth = use_label_smooth
         self.use_focal_loss = use_focal_loss
         self.weight_decay = weight_decay
+        # inference speed optimization
+        # if `use_static_shape` is True, use tensor.get_shape(), otherwise use tf.shape(tensor)
+        # static_shape is slightly faster
+        self.use_static_shape = use_static_shape
 
     def forward(self, inputs, is_training=False, reuse=False):
         # the input img_size, form: [height, weight]
@@ -44,6 +48,11 @@ class yolov3(object):
                                 activation_fn=lambda x: tf.nn.leaky_relu(x, alpha=0.1),
                                 weights_regularizer=slim.l2_regularizer(self.weight_decay)):
                 with tf.variable_scope('darknet53_body'):
+                    '''
+                    route_1: 1/8 size
+                    route_2: 1/16 size
+                    route_3: 1/32 size
+                    '''
                     route_1, route_2, route_3 = darknet53_body(inputs)
 
                 with tf.variable_scope('yolov3_head'):
@@ -54,7 +63,7 @@ class yolov3(object):
                     feature_map_1 = tf.identity(feature_map_1, name='feature_map_1')
 
                     inter1 = conv2d(inter1, 256, 1)
-                    inter1 = upsample_layer(inter1, tf.shape(route_2))
+                    inter1 = upsample_layer(inter1, route_2.get_shape().as_list() if self.use_static_shape else tf.shape(route_2))
                     concat1 = tf.concat([inter1, route_2], axis=3)
 
                     inter2, net = yolo_block(concat1, 256)
@@ -64,7 +73,7 @@ class yolov3(object):
                     feature_map_2 = tf.identity(feature_map_2, name='feature_map_2')
 
                     inter2 = conv2d(inter2, 128, 1)
-                    inter2 = upsample_layer(inter2, tf.shape(route_1))
+                    inter2 = upsample_layer(inter2, route_1.get_shape().as_list() if self.use_static_shape else tf.shape(route_1))
                     concat2 = tf.concat([inter2, route_1], axis=3)
 
                     _, feature_map_3 = yolo_block(concat2, 128)
@@ -77,16 +86,30 @@ class yolov3(object):
 
     def reorg_layer(self, feature_map, anchors):
         '''
-        feature_map: a feature_map from [feature_map_1, feature_map_2, feature_map_3] returned
-            from `forward` function
-        anchors: shape: [3, 2]
+        预测的box映射回原图
+        :param feature_map: [-1, rows_map, cols_map, 3 * (5+class_num)]
+        :param anchors: shape=(3,2)
+        :return: x_y_offset: [13, 13, 1, 2]
+                 boxes: [N, 13, 13, 3, 4], (center_x, center_y, w, h)， 映射回原图的坐标
+                 conf_logits: [N, 13, 13, 3, 1]
+                 prob_logits: [N, 13, 13, 3, class_num]
         '''
+
         # NOTE: size in [h, w] format! don't get messed up!
-        grid_size = tf.shape(feature_map)[1:3]  # [13, 13]
+        '''
+        以网格13*13举例： grid_size=[13, 13]
+        '''
+        grid_size = feature_map.get_shape().as_list()[1:3] if self.use_static_shape else tf.shape(feature_map)[1:3]  # [13, 13]
         # the downscale ratio in height and weight
+        '''
+        ratio: 32
+        '''
         ratio = tf.cast(self.img_size / grid_size, tf.float32)
         # rescale the anchors to the feature_map
         # NOTE: the anchor is in [w, h] format!
+        '''
+        anchor: [w,h]
+        '''
         rescaled_anchors = [(anchor[0] / ratio[1], anchor[1] / ratio[0]) for anchor in anchors]
 
         feature_map = tf.reshape(feature_map, [-1, grid_size[0], grid_size[1], 3, 5 + self.class_num])
@@ -103,20 +126,61 @@ class yolov3(object):
         # use some broadcast tricks to get the mesh coordinates
         grid_x = tf.range(grid_size[1], dtype=tf.int32)
         grid_y = tf.range(grid_size[0], dtype=tf.int32)
+
+        '''
+        x, y = tf.meshgrid(grid_x, grid_y)
+        1. 如果grid_x， grid_y的shape不是(n,)这样的格式， 则先拍平变成(n,)这样的格式
+        2. 假设：grid_x=[1,2,3], grid_y=[1,2,3]
+        x: [[1, 2, 3],
+            [1, 2, 3],
+            [1, 2, 3]] 3行， 3列
+        y: [[1, 1, 1],
+            [2, 2, 2],
+            [3, 3, 3]] 3行， 3列
+        '''
         grid_x, grid_y = tf.meshgrid(grid_x, grid_y)
+
+        '''
+        x_offset: [[1], [2], [3], [1], [2], [3], [1], [2], [3]]
+        y_offset: [[1], [1], [1], [2], [2], [2], [3], [3], [3]]
+        x_y_offset: [[1,1], 
+                     [2,1], 
+                     [3,1], 
+                     [1,2], 
+                     [2,2], 
+                     [3,2], 
+                     [1,3], 
+                     [2,3], 
+                     [3,3]]
+        '''
         x_offset = tf.reshape(grid_x, (-1, 1))
         y_offset = tf.reshape(grid_y, (-1, 1))
         x_y_offset = tf.concat([x_offset, y_offset], axis=-1)
+
         # shape: [13, 13, 1, 2]
+        '''
+        x_y_offset:
+                    [[[[1. 1.]]
+                      [[2. 1.]]
+                      [[3. 1.]]]
+                     [[[1. 2.]]
+                      [[2. 2.]]
+                      [[3. 2.]]]
+                     [[[1. 3.]]
+                      [[2. 3.]]
+                      [[3. 3.]]]]
+        '''
         x_y_offset = tf.cast(tf.reshape(x_y_offset, [grid_size[0], grid_size[1], 1, 2]), tf.float32)
 
         # get the absolute box coordinates on the feature_map 
         box_centers = box_centers + x_y_offset
+
         # rescale to the original image scale
+        # 中心坐标映射回原图
         box_centers = box_centers * ratio[::-1]
 
         # avoid getting possible nan value with tf.clip_by_value
-        box_sizes = tf.exp(box_sizes) * rescaled_anchors
+        box_sizes = tf.exp(box_sizes) * rescaled_anchors # 长宽与anchor的比值？
         # box_sizes = tf.clip_by_value(tf.exp(box_sizes), 1e-9, 100) * rescaled_anchors
         # rescale to the original image scale
         box_sizes = box_sizes * ratio[::-1]
@@ -147,7 +211,7 @@ class yolov3(object):
 
         def _reshape(result):
             x_y_offset, boxes, conf_logits, prob_logits = result
-            grid_size = tf.shape(x_y_offset)[:2]
+            grid_size = x_y_offset.get_shape().as_list()[:2] if self.use_static_shape else tf.shape(x_y_offset)[:2]
             boxes = tf.reshape(boxes, [-1, grid_size[0] * grid_size[1] * 3, 4])
             conf_logits = tf.reshape(conf_logits, [-1, grid_size[0] * grid_size[1] * 3, 1])
             prob_logits = tf.reshape(prob_logits, [-1, grid_size[0] * grid_size[1] * 3, self.class_num])
@@ -187,6 +251,13 @@ class yolov3(object):
     
     def loss_layer(self, feature_map_i, y_true, anchors):
         '''
+        功能：
+        :param feature_map_i: [-1, rows_map, cols_map, 3 * (5+class_num)]
+        :param y_true: [-1, rows_map, cols_map, 3, (5+class_num+1)]
+        :param anchors: shape=(3,2)， 真实的，未resize
+        :return:
+        '''
+        '''
         calc loss function from a certain scale
         input:
             feature_map_i: feature maps of a certain scale. shape: [N, 13, 13, 3*(5 + num_class)] etc.
@@ -195,42 +266,111 @@ class yolov3(object):
         '''
         
         # size in [h, w] format! don't get messed up!
+        '''
+        假设： grid_size=（13,13）
+        '''
         grid_size = tf.shape(feature_map_i)[1:3]
         # the downscale ratio in height and weight
+        '''
+        假设： img_size=(416,416)
+        ratio: 32
+        '''
         ratio = tf.cast(self.img_size / grid_size, tf.float32)
         # N: batch_size
         N = tf.cast(tf.shape(feature_map_i)[0], tf.float32)
 
+        '''
+        pred_boxes: [N, 13, 13, 3, 4]
+        '''
         x_y_offset, pred_boxes, pred_conf_logits, pred_prob_logits = self.reorg_layer(feature_map_i, anchors)
 
         ###########
         # get mask
         ###########
+
         # shape: take 416x416 input image and 13*13 feature_map for example:
         # [N, 13, 13, 3, 1]
         object_mask = y_true[..., 4:5]
-        # shape: [N, 13, 13, 3, 4] & [N, 13, 13, 3] ==> [V, 4]
-        # V: num of true gt box
-        valid_true_boxes = tf.boolean_mask(y_true[..., 0:4], tf.cast(object_mask[..., 0], 'bool'))
 
-        # shape: [V, 2]
-        valid_true_box_xy = valid_true_boxes[:, 0:2]
-        valid_true_box_wh = valid_true_boxes[:, 2:4]
+        # the calculation of ignore mask if referred from
+        # https://github.com/pjreddie/darknet/blob/master/src/yolo_layer.c#L179
+        ignore_mask = tf.TensorArray(tf.float32, size=0, dynamic_size=True) # dynamic_size指定数组长度可变
+
+        '''
+        idx < N: 遍历一个batch中的所有图片
+        '''
+        def loop_cond(idx, ignore_mask):
+            return tf.less(idx, tf.cast(N, tf.int32))
+        def loop_body(idx, ignore_mask):
+            '''
+            功能： 计算13×13*3个预测的box与gt box的IOU， 如果IOU高于0.5， 则对应的[13, 13, 3]的mask设为0， 否则为1
+            :param idx:
+            :param ignore_mask:
+            :return:
+            '''
+            # shape: [13, 13, 3, 4] & [13, 13, 3]  ==>  [V, 4]
+            # V: num of true gt box of each image in a batch
+            '''
+            tf.boolean_mask(tensor, mask): 返回tensor与mask中True元素同下标的部分
+            例：
+            a = tf.constant([[1,2,3],
+                             [4,5,6],
+                             [7,8,9]])
+            b = tf.constant([False,True, True])
+            c = tf.boolean_mask(a,b):
+                                     [[4 5 6]
+                                      [7 8 9]]
+            '...':指之间所有的维度,例；
+                a = np.array([[[1,2],[3,4]],
+                              [[5,6],[7,8]],
+                              [[9,1],[2,3]]])， shape=(3,2,2)
+                b = a[1, ..., 0:1]:
+                                    [[5]
+                                     [7]]
+            y_true[idx, ..., 0:4]: shape=(13,13,3,4)
+            object_mask[idx, ..., 0]: [13,13,3]
+            valid_true_boxes: [V,4], label: 表示有没有目标。 这里将网格中有的目标取出来， 即V：表示gt box的数量
+            '''
+            valid_true_boxes = tf.boolean_mask(y_true[idx, ..., 0:4], tf.cast(object_mask[idx, ..., 0], 'bool'))
+
+            # shape: [13, 13, 3, 4] & [V, 4] ==> [13, 13, 3, V]
+            '''
+            计算13×13*3中每个预测的box与所有gt box的IOU
+            '''
+            iou = self.box_iou(pred_boxes[idx], valid_true_boxes)
+            # shape: [13, 13, 3]
+            best_iou = tf.reduce_max(iou, axis=-1)
+            # shape: [13, 13, 3]
+            ignore_mask_tmp = tf.cast(best_iou < 0.5, tf.float32)
+            # finally will be shape: [N, 13, 13, 3]
+            ignore_mask = ignore_mask.write(idx, ignore_mask_tmp) # 指定idx位置写入tensor
+            return idx + 1, ignore_mask
+
+        '''
+        tf.while_loop(cond, body, loop_vars), 用法见例子：
+        例如我们要用tensorflow实现这样的函数：
+                                        i=0
+                                        n=10
+                                        while(i < n):
+                                            i = i+1
+        首先要有个判断语句： def cond(i,n):
+                                return i < n
+        之后是循环体： def body(i,n):
+                        i= i + 1
+                        return i, n
+                注意： body函数中虽然没有与n有关的操作，但必须要传入参数n，如果不传入n下次就无法判断了
+        最后合起来就是： 
+        i, n = tf.while_loop(cond,body,[i,n])
+        ignore_mask： shape=[N, 13, 13, 3]
+        '''
+        _, ignore_mask = tf.while_loop(cond=loop_cond, body=loop_body, loop_vars=[0, ignore_mask])
+        ignore_mask = ignore_mask.stack()
+        # shape: [N, 13, 13, 3, 1]
+        ignore_mask = tf.expand_dims(ignore_mask, -1)
+
         # shape: [N, 13, 13, 3, 2]
         pred_box_xy = pred_boxes[..., 0:2]
         pred_box_wh = pred_boxes[..., 2:4]
-
-        # calc iou
-        # shape: [N, 13, 13, 3, V]
-        iou = self.broadcast_iou(valid_true_box_xy, valid_true_box_wh, pred_box_xy, pred_box_wh)
-
-        # shape: [N, 13, 13, 3]
-        best_iou = tf.reduce_max(iou, axis=-1)
-
-        # get_ignore_mask
-        ignore_mask = tf.cast(best_iou < 0.5, tf.float32)
-        # shape: [N, 13, 13, 3, 1]
-        ignore_mask = tf.expand_dims(ignore_mask, -1)
 
         # get xy coordinates in one cell from the feature_map
         # numerical range: 0 ~ 1
@@ -292,9 +432,57 @@ class yolov3(object):
         class_loss = tf.reduce_sum(class_loss) / N
 
         return xy_loss, wh_loss, conf_loss, class_loss
+    
+
+    def box_iou(self, pred_boxes, valid_true_boxes):
+        '''
+
+        :param pred_boxes: [13, 13, 3, 4], (center_x, center_y, w, h), 映射回原图的
+        :param valid_true_boxes: [V, 4]
+        :return: iou
+        '''
+
+        # [13, 13, 3, 2]
+        pred_box_xy = pred_boxes[..., 0:2]
+        pred_box_wh = pred_boxes[..., 2:4]
+
+        # shape: [13, 13, 3, 1, 2]
+        pred_box_xy = tf.expand_dims(pred_box_xy, -2)
+        pred_box_wh = tf.expand_dims(pred_box_wh, -2)
+
+        # [V, 2]
+        true_box_xy = valid_true_boxes[:, 0:2]
+        true_box_wh = valid_true_boxes[:, 2:4]
+
+        # [13, 13, 3, 1, 2] & [V, 2] ==> [13, 13, 3, V, 2]
+        intersect_mins = tf.maximum(pred_box_xy - pred_box_wh / 2.,
+                                    true_box_xy - true_box_wh / 2.)
+        intersect_maxs = tf.minimum(pred_box_xy + pred_box_wh / 2.,
+                                    true_box_xy + true_box_wh / 2.)
+        intersect_wh = tf.maximum(intersect_maxs - intersect_mins, 0.)
+
+        # shape: [13, 13, 3, V]
+        intersect_area = intersect_wh[..., 0] * intersect_wh[..., 1]
+        # shape: [13, 13, 3, 1]
+        pred_box_area = pred_box_wh[..., 0] * pred_box_wh[..., 1]
+        # shape: [V]
+        true_box_area = true_box_wh[..., 0] * true_box_wh[..., 1]
+        # shape: [1, V]
+        true_box_area = tf.expand_dims(true_box_area, axis=0)
+
+        # [13, 13, 3, V]
+        iou = intersect_area / (pred_box_area + true_box_area - intersect_area + 1e-10)
+
+        return iou
 
     
     def compute_loss(self, y_pred, y_true):
+        '''
+        功能：
+        :param y_pred: [feature_map_1, feature_map_2, feature_map_3], 其中feature_map的shape是：[-1, rows_map, cols_map, 3 * (5+class_num)]
+        :param y_true: [y_true_13, y_true_26, y_true_52], 其中y_true的shape是： [-1, rows_map, cols_map, 3, (5+class_num+1)]
+        :return:
+        '''
         '''
         param:
             y_pred: returned feature_map list by `forward` function: [feature_map_1, feature_map_2, feature_map_3]
@@ -312,40 +500,3 @@ class yolov3(object):
             loss_class += result[3]
         total_loss = loss_xy + loss_wh + loss_conf + loss_class
         return [total_loss, loss_xy, loss_wh, loss_conf, loss_class]
-
-
-    def broadcast_iou(self, true_box_xy, true_box_wh, pred_box_xy, pred_box_wh):
-        '''
-        maintain an efficient way to calculate the ios matrix between ground truth true boxes and the predicted boxes
-        note: here we only care about the size match
-        '''
-        # shape:
-        # true_box_??: [V, 2]
-        # pred_box_??: [N, 13, 13, 3, 2]
-
-        # shape: [N, 13, 13, 3, 1, 2]
-        pred_box_xy = tf.expand_dims(pred_box_xy, -2)
-        pred_box_wh = tf.expand_dims(pred_box_wh, -2)
-
-        # shape: [1, V, 2]
-        true_box_xy = tf.expand_dims(true_box_xy, 0)
-        true_box_wh = tf.expand_dims(true_box_wh, 0)
-
-        # [N, 13, 13, 3, 1, 2] & [1, V, 2] ==> [N, 13, 13, 3, V, 2]
-        intersect_mins = tf.maximum(pred_box_xy - pred_box_wh / 2.,
-                                    true_box_xy - true_box_wh / 2.)
-        intersect_maxs = tf.minimum(pred_box_xy + pred_box_wh / 2.,
-                                    true_box_xy + true_box_wh / 2.)
-        intersect_wh = tf.maximum(intersect_maxs - intersect_mins, 0.)
-
-        # shape: [N, 13, 13, 3, V]
-        intersect_area = intersect_wh[..., 0] * intersect_wh[..., 1]
-        # shape: [N, 13, 13, 3, 1]
-        pred_box_area = pred_box_wh[..., 0] * pred_box_wh[..., 1]
-        # shape: [1, V]
-        true_box_area = true_box_wh[..., 0] * true_box_wh[..., 1]
-
-        # [N, 13, 13, 3, V]
-        iou = intersect_area / (pred_box_area + true_box_area - intersect_area + 1e-10)
-
-        return iou

@@ -11,6 +11,14 @@ import cv2
 
 def mix_up(img1, img2, bbox1, bbox2):
     '''
+    功能：将两张图片融合成一张图
+    :param img1:
+    :param img2:
+    :param bbox1:
+    :param bbox2:
+    :return:
+    '''
+    '''
     return:
         mix_img: HWC format mix up image
         mix_bbox: [N, 5] shape mix up bbox, i.e. `x_min, y_min, x_max, y_mix, mixup_weight`.
@@ -21,6 +29,9 @@ def mix_up(img1, img2, bbox1, bbox2):
     mix_img = np.zeros(shape=(height, width, 3), dtype='float32')
 
     # rand_num = np.random.random()
+    '''
+    np.random.beta(a, b, size=None): beta样本分布，在[0,1]内
+    '''
     rand_num = np.random.beta(1.5, 1.5)
     rand_num = max(0, min(1, rand_num))
     mix_img[:img1.shape[0], :img1.shape[1], :] = img1.astype('float32') * rand_num
@@ -271,19 +282,53 @@ def random_color_distort(img, brightness_delta=32, hue_vari=18, sat_vari=0.5, va
     return img
 
 
-def resize_with_bbox(img, bbox, new_width, new_height, interp=0):
+def letterbox_resize(img, new_width, new_height, interp=0):
+    '''
+    Letterbox resize. keep the original aspect ratio in the resized image.
+    '''
+    ori_height, ori_width = img.shape[:2]
+
+    resize_ratio = min(new_width / ori_width, new_height / ori_height)
+
+    resize_w = int(resize_ratio * ori_width)
+    resize_h = int(resize_ratio * ori_height)
+
+    img = cv2.resize(img, (resize_w, resize_h), interpolation=interp)
+    image_padded = np.full((new_height, new_width, 3), 128, np.uint8)
+
+    dw = int((new_width - resize_w) / 2)
+    dh = int((new_height - resize_h) / 2)
+
+    image_padded[dh: resize_h + dh, dw: resize_w + dw, :] = img
+
+    return image_padded, resize_ratio, dw, dh
+
+
+def resize_with_bbox(img, bbox, new_width, new_height, interp=0, letterbox=False):
     '''
     Resize the image and correct the bbox accordingly.
     '''
-    ori_height, ori_width = img.shape[:2]
-    img = cv2.resize(img, (new_width, new_height), interpolation=interp)
 
-    # xmin, xmax
-    bbox[:, [0, 2]] = bbox[:, [0, 2]] / ori_width * new_width
-    # ymin, ymax
-    bbox[:, [1, 3]] = bbox[:, [1, 3]] / ori_height * new_height
+    if letterbox:
+        image_padded, resize_ratio, dw, dh = letterbox_resize(img, new_width, new_height, interp)
 
-    return img, bbox
+        # xmin, xmax
+        bbox[:, [0, 2]] = bbox[:, [0, 2]] * resize_ratio + dw
+        # ymin, ymax
+        bbox[:, [1, 3]] = bbox[:, [1, 3]] * resize_ratio + dh
+
+        return image_padded, bbox
+    else:
+        ori_height, ori_width = img.shape[:2]
+
+        img = cv2.resize(img, (new_width, new_height), interpolation=interp)
+
+        # xmin, xmax
+        bbox[:, [0, 2]] = bbox[:, [0, 2]] / ori_width * new_width
+        # ymin, ymax
+        bbox[:, [1, 3]] = bbox[:, [1, 3]] / ori_height * new_height
+
+        return img, bbox
 
 
 def random_flip(img, bbox, px=0, py=0):
@@ -344,10 +389,3 @@ def random_expand(img, bbox, max_ratio=4, fill=0, keep_ratio=True):
     bbox[:, 2:4] += (off_x, off_y)
 
     return dst, bbox
-
-
-
-
-
-
-
